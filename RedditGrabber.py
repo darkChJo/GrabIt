@@ -7,6 +7,7 @@ import time
 import argparse
 import youtube_dl
 import json
+from multiprocessing import Pool
 import traceback
 import logging
 from resources.log_color import ColoredFormatter
@@ -42,79 +43,90 @@ def grabber(subR, base_dir, posts, sort):
         elif sort == 'new': submissions = reddit.subreddit(subR).new(limit = int(posts))
         elif sort == 'top': submissions = reddit.subreddit(subR).top(limit = int(posts))
 
-    for submission in submissions:
-        title = submission.title
-        logger.debug("Submission url {}".format(submission.url))
-        link = submission.url
-        ''' django URL validation regex '''
-        regex = re.compile(
-                r'^(?:http|ftp)s?://' # http:// or https://
-                r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' #domain...
-                r'localhost|' #localhost...
-                r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' # ...or ip
-                r'(?::\d+)?' # optional port
-                r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    queue = []
 
-        if not (db.checkPost(submission.permalink.split("/")[4])) and not(submission.author in config["reddit"]["blacklist"]) and re.match(regex, link):
-            downloaded = True
-            print_title = title.encode('utf-8')[:25] if len(title) > 25 else title.encode('utf-8')
-            logger.info("Post: {}...({}) From: {} By: {}".format(print_title, submission.id, subR, str(submission.author)))
-            title = formatName(title)
+    for submission in submissions:        
+        queue.append(submission)
 
-            path = {'author': str(submission.author), 'subreddit': str(submission.subreddit)}
+    print(len(queue))
+    with Pool(processes = 5) as pool:
+        pool.map(download, queue, 3)
+    # download(queue, subR)
 
-            # Selftext post
-            if submission.is_self:
-                with open(os.path.join(save.get_dir(path),'{}-{}.txt'.format(str(submission.id), formatName(title))), 'a+') as f:
-                    f.write(str(submission.selftext.encode('utf-8')))
+def download(submission):
+    
+    ''' django URL validation regex '''
+    regex = re.compile(
+            r'^(?:http|ftp)s?://' # http:// or https://
+            r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' #domain...
+            r'localhost|' #localhost...
+            r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' # ...or ip
+            r'(?::\d+)?' # optional port
+            r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    # for submission in queue:
+    title = submission.title
+    logger.debug("Submission url {}".format(submission.url))
+    link = submission.url
+    if not (db.checkPost(submission.permalink.split("/")[4])) and not(submission.author in config["reddit"]["blacklist"]) and re.match(regex, link):
+        downloaded = True
+        print_title = title.encode('utf-8')[:25] if len(title) > 25 else title.encode('utf-8')
+        logger.info("Post: {}...({}) From: {} By: {}".format(print_title, submission.id, submission.subreddit, str(submission.author)))
+        title = formatName(title)
 
-            # Link to a jpg, png, gifv, gif, jpeg
-            elif any(ext in link for ext in ['.jpg', '.png', '.gif', 'gifv', 'jpeg']) or 'i.reddituploads.com' in link:
-                Common(link, '{}-{}'.format(str(submission.id),title), save.get_dir(path))
+        path = {'author': str(submission.author), 'subreddit': str(submission.subreddit)}
 
-            # Imgur
-            elif re.match(Imgur.valid_url, link):
-                Imgur(link, title, save.get_dir(path))
+        # Selftext post
+        if submission.is_self:
+            with open(os.path.join(save.get_dir(path),'{}-{}.txt'.format(str(submission.id), formatName(title))), 'a+') as f:
+                f.write(str(submission.selftext.encode('utf-8')))
 
-            # Giphy
-            elif re.match(Giphy.valid_url, link):
-                Giphy(link, title, save.get_dir(path))
+        # Link to a jpg, png, gifv, gif, jpeg
+        elif any(ext in link for ext in ['.jpg', '.png', '.gif', 'gifv', 'jpeg']) or 'i.reddituploads.com' in link:
+            Common(link, '{}-{}'.format(str(submission.id),title), save.get_dir(path))
 
-            # Tenor
-            elif re.match(Tenor.valid_url, link):
-                Tenor(link, title, save.get_dir(path))
+        # Imgur
+        elif re.match(Imgur.valid_url, link):
+            Imgur(link, title, save.get_dir(path))
 
-            # Flickr
-            elif 'flickr.com/' in link:
-                logger.debug("No Flickr support")
+        # Giphy
+        elif re.match(Giphy.valid_url, link):
+            Giphy(link, title, save.get_dir(path))
+
+        # Tenor
+        elif re.match(Tenor.valid_url, link):
+            Tenor(link, title, save.get_dir(path))
+
+        # Flickr
+        elif 'flickr.com/' in link:
+            logger.debug("No Flickr support")
+            with open(os.path.join(base_dir, 'error.txt'), 'a+') as logFile:
+                    logFile.write('Needs support: ' + link + '\n')
+
+        # Reddit submission
+        elif 'reddit.com/r/' in link:
+            downloaded = False
+            with open(os.path.join(base_dir, 'error.txt'), 'a+') as logFile:
+                logFile.write('Link to reddit ' + link + ' by ' + str(submission.author) + ' \n')
+                logFile.close()
+        
+        # All others are caught by youtube-dl, if still no match it's written to the log file
+        else:
+            folder = save.get_dir(path)
+            ydl_opts = {
+                'format': 'best',
+                'outtmpl': os.path.join(folder, '%(id)s-%(title)s.%(ext)s'),
+                'quiet': 'quiet'
+            }
+            try:
+                with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([link])
+            except youtube_dl.utils.DownloadError:
+                logger.info("No matches: {}".format(link))
                 with open(os.path.join(base_dir, 'error.txt'), 'a+') as logFile:
-                        logFile.write('Needs support: ' + link + '\n')
-
-            # Reddit submission
-            elif 'reddit.com/r/' in link:
+                    logFile.write('No matches: ' + link + '\n')
                 downloaded = False
-                with open(os.path.join(base_dir, 'error.txt'), 'a+') as logFile:
-                    logFile.write('Link to reddit ' + link + ' by ' + str(submission.author) + ' \n')
-                    logFile.close()
-            
-            # All others are caught by youtube-dl, if still no match it's written to the log file
-            else:
-                folder = save.get_dir(path)
-                ydl_opts = {
-                    'format': 'best',
-                    'outtmpl': os.path.join(folder, '%(id)s-%(title)s.%(ext)s'),
-                    'quiet': 'quiet'
-                }
-                try:
-                    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([link])
-                except youtube_dl.utils.DownloadError:
-                    logger.info("No matches: {}".format(link))
-                    with open(os.path.join(base_dir, 'error.txt'), 'a+') as logFile:
-                        logFile.write('No matches: ' + link + '\n')
-                    downloaded = False
-            if downloaded:
-                db.insertPost(submission.permalink, submission.title, submission.created, str(submission.author), submission.url)
+        if downloaded:
+            db.insertPost(submission.permalink, submission.title, submission.created, str(submission.author), submission.url)
 
 '''
 Removes special characters and shortens long
